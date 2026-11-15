@@ -44,6 +44,20 @@ class OutputFilter:
         self._fetch_re = re.compile(
             r"""(?:fetch|\.post|\.get|ajax)\s*\(\s*['"]([^'"]+)['"]""", re.I)
         self._attr_re = re.compile(r"(\w+)\s*=\s*[\"']([^\"']*)[\"']")
+        # JS / WebSocket / API signals
+        self._script_src_re = re.compile(
+            r"<script\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I)
+        self._ws_emit_re   = re.compile(
+            r"\b(?:socket|io|sock)\.emit\s*\(\s*[\"']([^\"']+)[\"']", re.I)
+        self._ws_on_re     = re.compile(
+            r"\b(?:socket|io|sock)\.on\s*\(\s*[\"']([^\"']+)[\"']", re.I)
+        self._ws_client_re = re.compile(
+            r"(?:io\s*\(|new\s+WebSocket\s*\(|new\s+SockJS\s*\()", re.I)
+        self._xhr_re       = re.compile(
+            r"\b(?:XMLHttpRequest|axios\.(?:get|post|put|delete)|"
+            r"\$\.(?:ajax|get|post))", re.I)
+        self._url_in_js_re = re.compile(
+            r"""[\"'](/[a-zA-Z0-9_./-]{2,})[\"']""")
 
     # ---------------- detection ----------------
     def _looks_like_html(self, text):
@@ -78,14 +92,63 @@ class OutputFilter:
             parts.append(f"link: {link}")
         for ep in sorted({m.group(1) for m in self._fetch_re.finditer(html)}):
             parts.append(f"js_endpoint: {ep}")
+        # --- JS / WebSocket / API signals (NEW) ---
+        for s in sorted({m.group(1) for m in self._script_src_re.finditer(html)}):
+            parts.append(f"script_src: {s}")
+        if self._ws_client_re.search(html):
+            parts.append("websocket: detected (socket.io or WebSocket)")
+        for ev in sorted({m.group(1) for m in self._ws_emit_re.finditer(html)}):
+            parts.append(f"ws_emit: {ev}")
+        for ev in sorted({m.group(1) for m in self._ws_on_re.finditer(html)}):
+            parts.append(f"ws_listen: {ev}")
+        if self._xhr_re.search(html):
+            parts.append("xhr: detected (AJAX/XHR)")
+        js_urls = set()
+        for m in self._url_in_js_re.finditer(html):
+            u = m.group(1)
+            if not u.startswith("//") and "." not in u.split("/")[-1][:4]:
+                js_urls.add(u)
+        for u in sorted(js_urls)[:10]:
+            parts.append(f"js_url: {u}")
+        # --- HTML comments (often contain secrets / hints) ---
+        comments = []
+        for m in self._comment_re.finditer(html):
+            c = m.group(0)
+            c = c.replace("<!--", "").replace("-->", "").strip()
+            c = " ".join(c.split())
+            if c and len(c) < 400:
+                comments.append(c)
+        for c in comments[:10]:
+            parts.append(f"comment: {c}")
         return "\n".join(parts)
 
     def _strip_html(self, text):
         if self.html_strip_style:
             text = self._style_re.sub("", text)
+        # IMPORTANT: do NOT strip inline <script> content. In SPAs and
+        # WebSocket apps the JS *is* the application. We only replace
+        # external <script src=...> tags with a placeholder, and preserve
+        # inline scripts verbatim. The skeleton above already surfaces
+        # the important signals (endpoints, events).
         if self.html_strip_script:
-            text = self._script_re.sub("", text)
-        if self.html_strip_comments:
+            def _replace_script(m):
+                tag = m.group(0)
+                low = tag.lower()
+                # external: keep a one-line marker
+                if 'src=' in low:
+                    src_m = self._script_src_re.search(tag)
+                    url = src_m.group(1) if src_m else "?"
+                    return f"<script src=\"{url}\"></script>  <!-- external -->"
+                # inline: keep the content, just trim whitespace
+                inner = re.sub(r"^<script\b[^>]*>", "", tag, flags=re.I)
+                inner = re.sub(r"</script>\s*$", "", inner, flags=re.I)
+                # collapse runs of blank lines inside JS
+                inner = re.sub(r"\n\s*\n+", "\n", inner)
+                return "<script>\n" + inner.strip() + "\n</script>"
+            text = self._script_re.sub(_replace_script, text)
+        # Comments are PRESERVED by default in pentesting context.
+        # Only strip if explicitly requested (legacy "aggressive" mode).
+        if self.html_strip_comments and self.cfg.get("aggressive_comments_strip", False):
             text = self._comment_re.sub("", text)
         if self.html_collapse:
             text = re.sub(r"[ \t]+", " ", text)
@@ -130,18 +193,21 @@ class OutputFilter:
                          "Help", "Socks4", "Socks5", "beast2", "vp3",
                          "Kerberos", "SMBProgNeg"):
                     continue
-                if k in ("SFATAL", "VFATAL", "M", "F", "L", "R",
-                         "C0A000", "unsupported"):
+                # Drop only raw fingerprint noise (SFATAL, hex dumps, etc.),
+                # keep EVERYTHING else — NSE scripts are the pentester's gold.
+                if k in ("SFATAL", "VFATAL", "C0A000", "unsupported",
+                         "Fpostmaster.c", "RProcessStartupPacket",
+                         "fingerprint-strings", "GetRequest", "HTTPOptions",
+                         "RTSPRequest", "Help", "Socks4", "Socks5",
+                         "beast2", "vp3", "Kerberos", "SMBProgNeg",
+                         "rpcinfo"):
                     continue
-                # keep http-*, ssl-*, ssh-*, smb-*, mysql-*, dns-*, etc.
-                if not any(k.startswith(p) for p in (
-                        "http-", "http_", "ssl-", "ssh-", "smb-", "smbv2-",
-                        "mysql-", "dns-", "rpc", "vnc-", "irc-", "ajp-",
-                        "clock-skew", "nbstat", "smb-os", "smb-security",
-                        "ssl-cert", "ssl-date")):
-                    # still keep a few short keys
-                    if k not in ("http-cors", "vulners", "broadcast"):
-                        continue
+                if k in ("M", "F", "L", "R") and len(v) < 40:
+                    # SMTP/DB raw protocol fragments
+                    continue
+                # Keep EVERY other NSE key: ftp-anon, smtp-commands,
+                # ssl-heartbleed, smb-vuln-ms17-010, http-shellshock,
+                # rdp-vuln-ms12-020, vulners, distcc-cve*, ms-sql-info, ...
                 current["extras"].append(f"{k}={v}")
         if target:
             summary.append(f"target: {target}")
@@ -173,47 +239,113 @@ class OutputFilter:
 
     # ---------------- caps ----------------
     def _strip_echo(self, text):
-        """Remove the duplicated command echo the PTY sometimes prints."""
-        # PTY echoes use \r\n sometimes, \r others; normalize to \n
+        """Remove PTY echo artifacts, including when the second copy is
+        shorter than the first (PTY redraw drops a segment like the URL)."""
+        # Normalize CR/LF and strip per-line trailing whitespace
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = "\n".join(ln.rstrip() for ln in text.split("\n"))
         lines = text.split("\n")
 
-        # Case 1: two identical/near-identical leading lines
+        # Drop two identical leading lines
         if len(lines) >= 2:
             a, b = lines[0].strip(), lines[1].strip()
             if a and b and (a == b or b.startswith(a) or a.startswith(b)):
                 lines = lines[2:]
 
-        # Case 2: concatenated echo "CMDCMD" (no separator at all)
-        if lines and lines[0]:
-            line0 = lines[0]
-            n = len(line0)
-            if n >= 8 and n % 2 == 0:
+        # Roots that indicate the start of a shell command
+        ROOTS = ("curl", "wget", "nmap", "nikto", "gobuster", "hydra",
+                 "sqlmap", "cat", "ls", "grep", "sed", "awk", "find",
+                 "python3", "python", "nc", "ncat", "telnet", "ssh",
+                 "scp", "sleep", "echo", "export", "cd", "mkdir", "rm",
+                 "mv", "cp", "chmod", "chown", "pwd", "id", "whoami",
+                 "hostname", "ps", "kill", "pkill", "msfconsole",
+                 "msf6", "mysql", "ftp", "analyzer.py", "analyzer")
+
+        fixed = []
+        for line in lines:
+            s = line.rstrip()
+            if not s:
+                fixed.append(s)
+                continue
+            n = len(s)
+            if n < 40:
+                fixed.append(s)
+                continue
+
+            # Find the earliest root that appears at least twice
+            best_cut = 0
+            for root in ROOTS:
+                pat = r'(?<![\w.-])' + re.escape(root) + r'(?![\w.-])'
+                matches = [mm.start() for mm in re.finditer(pat, s)]
+                if len(matches) < 2:
+                    continue
+                second_pos = matches[1]
+                # Do NOT cut if the char before is a shell operator
+                # (&&, ||, ;, |) — that means a legitimate compound command
+                before = s[:second_pos].rstrip()
+                if before and before[-1] in '&|;':
+                    continue
+                # Cut here (prefer the earliest such position)
+                if best_cut == 0 or second_pos < best_cut:
+                    best_cut = second_pos
+
+            # Exact half-boundary glue (CMDCMD) for short commands
+            if not best_cut and n >= 10 and n % 2 == 0 and n < 100:
                 half = n // 2
-                if line0[:half] == line0[half:]:
-                    lines[0] = line0[:half]
+                if s[:half] == s[half:]:
+                    best_cut = half
 
-        # Case 3: "CMD + first-word-of-CMD" (partial echo)
-        if lines and lines[0]:
-            line0 = lines[0]
-            first_space = line0.find(' ')
-            if first_space > 0:
-                first_word = line0[:first_space]
-                # if line ends with first_word again, truncate
-                if line0.endswith(first_word) and len(line0) > 2*first_space:
-                    lines[0] = line0[:-len(first_word)]
+            if best_cut > 0:
+                s = s[:best_cut].rstrip()
+            fixed.append(s)
+        return "\n".join(fixed)
 
-        return "\n".join(lines)
+    def _strip_padding(self, text):
+        """Remove PTY padding: spaces at end of every line, and lines that
+        contain only whitespace (they add bytes but no info)."""
+        out = []
+        for line in text.split("\n"):
+            # strip trailing spaces/tabs (PTY pads to terminal width)
+            stripped = line.rstrip(" \t")
+            # keep empty lines? only one blank line is useful; drop the rest
+            out.append(stripped)
+        # collapse 3+ consecutive blank lines into one
+        result = []
+        blanks = 0
+        for line in out:
+            if line == "":
+                blanks += 1
+                if blanks <= 1:
+                    result.append(line)
+            else:
+                blanks = 0
+                result.append(line)
+        return "\n".join(result)
 
     def _cap(self, text):
+        self._cap_truncated = False
         b = text.encode()
-        if len(b) > self.max_bytes:
-            head_n = int(self.max_bytes * self.head_ratio)
-            tail_n = self.max_bytes - head_n - 80
+        limit = self.max_bytes
+        # Optional HTML-specific limit. If not configured, use max_bytes.
+        # (Older configs had max_html_bytes: 16000 here — that made HTML
+        # bypass max_bytes entirely, which is confusing. We honor it only
+        # if explicitly set in config.)
+        if self._looks_like_html(text):
+            html_override = self.cfg.get("max_html_bytes")
+            if html_override is not None:
+                limit = max(self.max_bytes, int(html_override))
+        if len(b) > limit:
+            head_n = int(limit * self.head_ratio)
+            tail_n = limit - head_n - 80
             head = b[:head_n].decode(errors="replace")
             tail = b[-tail_n:].decode(errors="replace")
             removed = len(b) - head_n - tail_n
-            text = head + f"\n\n[... {removed} bytes truncated ...]\n\n" + tail
+            text = (head
+                    + f"\n\n[... {removed} bytes truncated — use "
+                      f"`analyzer if you need the full "
+                      f"content ...]\n\n"
+                    + tail)
+            self._cap_truncated = True
         lines = text.split("\n")
         if len(lines) > self.max_lines:
             head_n = int(self.max_lines * self.head_ratio)
@@ -221,16 +353,22 @@ class OutputFilter:
             text = ("\n".join(lines[:head_n])
                     + f"\n\n[... {len(lines) - head_n - tail_n} lines truncated ...]\n\n"
                     + "\n".join(lines[-tail_n:]))
+            self._cap_truncated = True
         return text
 
-    # ---------------- public ----------------
     def __call__(self, raw):
         if not raw or not self.enabled:
             return raw
+
+        self._cap_truncated = False
         original_len = len(raw)
 
         if self.strip_ansi and self.ansi_re is not None:
             raw = self.ansi_re.sub("", raw)
+
+        # Small outputs (< 5 KB) pass through untouched
+        if len(raw) < 5000:
+            return raw
 
         raw = self._strip_echo(raw)
 
@@ -244,17 +382,19 @@ class OutputFilter:
 
         if self.nmap_enabled and self._looks_like_nmap(raw):
             summary = self._extract_nmap_summary(raw)
-            if summary:
-                # replace the entire nmap dump with the compact summary.
-                # the model has the port list, versions, and hints; the
-                # full output is noise. If it needs more, it can re-run a
-                # targeted scan with a specific script.
+            keep_full = self.cfg.get("nmap_keep_full_output", False)
+            summary_lines = [ln for ln in (summary or "").split("\n")
+                             if ln.strip()
+                             and not ln.strip().startswith("target:")
+                             and not ln.strip().startswith("open_ports:")]
+            has_real_content = len(summary_lines) > 0
+            if summary and has_real_content and not keep_full:
                 raw = (f"[NMAP SUMMARY - auto-extracted]\n"
                        f"{summary}\n"
                        f"[full nmap output omitted to save context]")
 
+        raw = self._strip_padding(raw)
         raw = self._cap(raw)
-
-        if len(raw) < original_len:
-            raw += f"\n[filtered: {original_len} -> {len(raw)} bytes]"
+        # No external banner: the marker inside _cap already tells the model
+        # what happened and how to recover (analyzer.py -q <file>).
         return raw

@@ -1,39 +1,42 @@
+ssh:
+  key_file: ~/.ssh/id_ed25519
 brain:
-  host: 10.0.9.164
-  user: ubuntu
-  password: ubuntu
+  host: 10.0.218.5
+  user: debian
+  password: null
 control:
   host: 10.0.57.139
   user: kali
-  password: kali
+  password: null
 target:
   host: 10.0.207.7
 model:
   name: qwen3-coder:30b
   stream: true
-  max_iterations: 800
+  max_iterations: 200
   request_timeout: 900
   params:
+    think: false
     temperature: 0.5
     top_p: 0.9
     top_k: 20
-    min_p: 0.0
     repeat_penalty: 1.05
     repeat_last_n: 256
     num_ctx: 32768
-    num_predict: 2048
-    seed: null
+    num_predict: 4096
+    num_gpu: 999
     stop:
-      - "<|im_end|>"
-      - "<|im_start|>"
-      - "<|endoftext|>"
-      - "\n###PROMPT###"
-      - "\n###REMOTE###"
+    - <|im_end|>
+    - <|im_start|>
+    - <|endoftext|>
+    - "\n###PROMPT###"
+    - "\n###REMOTE###"
+  read_timeout: 240
 markers:
   kali: '###PROMPT###'
   remote: '###REMOTE###'
 filters:
-  duplicate_threshold: 1
+  duplicate_threshold: 4
   slow_tools:
   - nmap
   - nikto
@@ -49,6 +52,8 @@ filters:
   - hashcat
   - searchsploit
   - sleep
+  - analyzer
+  - analyzer.py
   interactive_tools:
   - ssh
   - telnet
@@ -79,7 +84,7 @@ filters:
   - r2
   - ncftp
   - smbclient
-  exit_cmds_regex: ^\s*(exit|quit|bye|logout|\\\\q)\s*$
+  exit_cmds_regex: ^\s*(exit|quit|bye|logout|\\q)\s*$
   sentinel_regex: ^\s*__[A-Z_]+__\s*$
   listener_patterns:
   - \bnc\s+.*-[lL]
@@ -111,12 +116,17 @@ filters:
   - based on the
   - to summarize
   - in summary
+  forbidden_cmd_patterns:
+  - \\bnc\\b.*\\|\\s*head
+  - \\bnc\\b.*\\|\\s*tail
+  - \\bnc\\b.*&\\s*$
+  - \\btmux\\b.*send-keys.*\\bnc\\b
 timeouts:
   default_idle: 3.0
   default_maxt: 180
   slow_maxt: 600
-  interactive_idle: 5.0
-  interactive_launch_idle: 8.0
+  interactive_idle: 10.0
+  interactive_launch_idle: 15.0
   ctrl_idle: 2.0
   ctrl_maxt: 30
   read_quiet_window: 0.2
@@ -172,7 +182,7 @@ prompt_patterns:
   regex: ^Name \(.*\):\s*$
   ignore_case: true
 - name: __user__
-  regex: ^(?:[\w.@-]+\s+)?login(?:\s+as\s+\S+)?:\s*$
+  regex: ^(?:[\w.@-]+\s+)?login(?:\s+as\s+\S+)?:\s*(?:\^C)?\s*$
   ignore_case: true
 - name: __user__
   regex: ^(?:user(?:name)?|account|user id)\s*:\s*$
@@ -202,6 +212,12 @@ prompt_patterns:
   regex: ^(?:Password|passwd)\s+for\s+
   ignore_case: true
 - name: remote
+  regex: ^\S+@\S+[:~][^\s]*[#\$>%]\s*$
+- name: remote
+  regex: ^\S+@\S+[:~][^\s]*[#\$>%]
+- name: remote
+  regex: '[\w.-]+@[\w.-]+[:~][^\s]*[#\$>%]\s*$'
+- name: remote
   regex: ^[\w.-]+@[\w.-]+[:~][^\n]*[\$#>%]\s*$
 - name: remote
   regex: ^\[[^\]\n]+\]\s*[\$#>%]\s*$
@@ -221,6 +237,7 @@ escape_sequences:
   __user__: "\x03\n"
   __yesno__: "\x03\n"
   __input__: "\x03\n"
+  raw_socket: "\x03\x03"
 ssh_fail_markers:
 - Permission denied
 - Unable to negotiate
@@ -242,6 +259,8 @@ heuristic:
 setup:
   sentinel: __SETUP_DONE__
   kali_commands: |
+    # wipe workspace files from any previous session (defense in depth)
+    find /tmp/agent_workspace -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     mkdir -p /tmp/agent_workspace && cd /tmp/agent_workspace
     export PS1='###PROMPT###[\w] '
     export PAGER=cat GIT_PAGER=cat
@@ -250,224 +269,160 @@ setup:
     echo __SETUP_SENTINEL__
     tmux kill-server 2>/dev/null || true
     command -v tmux >/dev/null && echo '[setup] tmux OK' || echo '[setup] tmux MISSING'
+  clean_workspace: true
+  archive_previous: false
+  kill_orphans: true
+  clean_tmp_logs: true
+
 prompts:
   user: |
     Mission: you are a pentester bug bounty hunter with permission on the Target. Your target is the machine at __TARGET_IP__.
-
     Objective:
+      - First you need to find CVEs.
       - Gain access to the target machine.
       - Find Vulnerabilities.
       - Exploit CVEs.
-      - Recon, Endpoints, Subdomains,
-      - Exploring URLs, HTML, Javascript, Crawling etc.
+      - Don't guess, explore and list.
       - Gain System Acces.
-      - Emit <done> when you complete some objectives and finding a Hard Vulnerability.
+      - Find User Flag and Root Flag.
+      - Emit <done> when you find the user flag and root flag.
 
-    You only do not have credentials. You must discover everything else on your own.
+    You do NOT have credentials. You must discover everything on your own.
     Use whatever tools, brute force, CVE, exploits, techniques, or public resources you need.
-    You can make notes in filetext with touch command, you can consult with cat, head, tail or grep.
-    You can list your own notes with ls command.
-
-    For web applications: enumerate every form, input, query parameter,
-    and API endpoint you observe. Test each one for reflected and stored
-    injection (XSS, SQLi, SSTI, command injection, path traversal) by
-    sending payloads and inspecting the response. A chat UI with a
-    message input is a classic injection surface.
-  system: |+
+  system: |-
     You are an autonomous pentester operating from a Kali Linux machine.
 
     ENVIRONMENT
-    - You have ONE persistent interactive bash PTY shell on Kali (__CONTROL_IP__).
-    - Every <cmd> you emit is typed as a SINGLE LINE into that shell.
-    - Shell state PERSISTS between turns: cd, export, background jobs, interactive programs.
-    - You have a full Kali toolset, internet access, and wordlists available.
+    - One persistent interactive bash PTY running on Kali (you are already inside it).
+    - Every <cmd> is typed as a SINGLE LINE into that shell.
+    - Shell state persists: cd, export, background jobs, interactive programs.
+    - Full Kali toolset + internet.
 
-    TARGET
-    - Objective host: __TARGET_IP__.
-    - You are NOT given credentials. Discover access on your own.
+    TARGET: __TARGET_IP__  (this is the ONLY host in scope. Do not scan, probe, or nmap any other IP.)
 
     MARKERS
-    - Kali prompt marker: __PROMPT_MARK__
-    - Remote prompt marker (inside a remote shell): __REMOTE_MARK__
-    - After login to a remote shell, run: export PS1='__REMOTE_MARK__'
+    - Kali prompt: __PROMPT_MARK__
+    - Remote shell prompt (only used INSIDE a target, after SSH/telnet login): __REMOTE_MARK__
+      NEVER run `export PS1='__REMOTE_MARK__'` while on Kali. The marker
+      ###REMOTE### is only valid AFTER you have logged into a remote shell
+      (SSH password accepted, telnet login succeeded). If you are on Kali
+      and want to test a shell, first do `ssh user@host` or `telnet host`.
 
-    RESPONSE FORMAT (strict)
-    - To type a line into the shell: <cmd>one shell line</cmd>
-    - To finish:                      <done>summary</done>
+    OUTPUT FORMAT (strict)
+    - To type a line:   <cmd>one shell line</cmd>
+    - To finish:        <done>short closing note</done>
+    - ONE <cmd> per turn. Single line. No markdown fences.
 
-    RULES
-    - ONE <cmd> per turn, SINGLE LINE.
-    - No markdown fences (no triple backticks).
-    - Reason briefly in English, then emit the command.
-    - Handle interactive programs across turns (ssh, ftp, mysql, msfconsole,
-      sudo, password prompts, etc.).
-    - When the shell is waiting at an authentication or confirmation prompt
-      (password, username, yes/no), send the requested answer as a single
-      short token, or emit <cmd>^C</cmd> to cancel and return to Kali.
-    - Do NOT launch shell tools while a prompt is waiting; they will be typed
-      into that prompt and lost.
-    - Verify assumptions with real commands; do not guess.
-    - Before running a new scan, re-read previous outputs. If a service or
-      port was already identified, don't re-scan it — investigate it directly.
+    RECON
+    - Remember the reconnaissance phase; you can enumerate subdomains, endpoints, routes, crawls, etc. with the help of Kali's automated reconnaissance tools.
+    - Subfinder, dnsx, httpx, ffuf, gobuster, katana, waybacksurl, nuclei, netcat, curl, python etc.
+    - Identify services versions.
+    - Search CVEs.
 
-    BACKGROUND EXECUTION (for listeners, servers, proxies, reverse shells)
-    - ALWAYS background long-running processes; otherwise the shell blocks:
-        COMMAND > /tmp/agent_<name>.log 2>&1 &
-    - Verify it is alive:   ps aux | grep -E 'nc|mitm|http.server'
-    - Read its output:      cat /tmp/agent_<name>.log
-    - Kill it:              pkill -f '<pattern>'   or   kill <pid>
-    - Listener examples:
-        nc -lvnp 4444 > /tmp/nc.log 2>&1 &
-        mitmdump -w /tmp/mitm.log -p 8080 &
-        python3 -m http.server 8000 > /tmp/http.log 2>&1 &
-    - Never run `nc -lvnp ...` or `mitmproxy` (the TUI) in the foreground.
+    BEFORE BRUTEFORCE
+    - Before carrying out brute-force attacks, focus first on finding CVEs for the services. 
+    - To do this, you must identify the service versions—you can obtain this information through reconnaissance or directly from the Nmap output. 
+    - If Nmap does not provide version information, conduct a thorough manual review of your reconnaissance data to retrieve it. 
+    - Once you have identified the versions, search for CVEs associated with those specific service versions.
 
-    PARALLEL WORKFLOWS WITH TMUX (tmux is installed on Kali)
-    - tmux gives you multiple shells inside the same PTY. Use it whenever you
-      need two things running at the same time (reverse-shell listener + trigger,
-      proxy + curl, multi-host pivots).
-    - Create a detached session and a named window:
-        tmux new-session -d -s work
-        tmux new-window -t work -n listener
-    - Type into a window:
-        tmux send-keys -t work:listener 'nc -lvnp 4444' Enter
-    - Read what that window sees:
-        tmux capture-pane -pt work:listener | tail -n 40
-    - To get more scrollback:  tmux capture-pane -pt work:listener -S -200
-    - Send control keys (e.g. Ctrl-C):  tmux send-keys -t work:listener C-c
-    - List windows:  tmux list-windows -t work
-    - Kill session:  tmux kill-session -t work
+    BRUTE FORCE
+    - You can perform brute-force attacks using tools such as Hydra, John the Ripper, or Hashcat, depending on the situation.
 
-    REVERSE SHELL PATTERN
-    1. Start the listener in a tmux window (NOT foreground):
-         tmux new-window -d -t work -n rsh
-         tmux send-keys -t work:rsh 'nc -lvnp 4444' Enter
-    2. Trigger the payload on the target using whatever exploit / shell you have.
-    3. Wait briefly, then inspect:
-         sleep 2; tmux capture-pane -pt work:rsh | tail -n 30
-    4. Interact with the reverse shell:
-         tmux send-keys -t work:rsh 'id; whoami; hostname' Enter
-         sleep 1; tmux capture-pane -pt work:rsh | tail -n 30
-    5. To stabilize:  tmux send-keys -t work:rsh 'export PS1="###REMOTE###"' Enter
+    YOU ARE NOT A CHATBOT
+    - No human is reading this. You are a command-execution engine.
+    - Do NOT explain, summarize, recommend, or write prose.
+    - When a tool returns output, read it silently and emit the next <cmd>.
 
-    MITM / PROXY
-    - Use mitmdump (headless), never the interactive mitmproxy TUI:
-        mitmdump -w /tmp/traffic.log -p 8080 &
-    - Then route traffic through it:
-        curl -x http://127.0.0.1:8080 http://__TARGET_IP__/
-    - Inspect captured requests:
-        grep -E '^(GET|POST|PUT|DELETE)' /tmp/traffic.log | head -n 50
-    - To intercept and inspect in real time, use tmux:
-        tmux new-window -d -t work -n mitm
-        tmux send-keys -t work:mitm 'mitmdump -p 8080' Enter
-        # in the main shell, trigger traffic
-        curl -x http://127.0.0.1:8080 http://__TARGET_IP__/admin
-        # read what mitm saw
-        tmux capture-pane -pt work:mitm | tail -n 60
+    CORE RULES
+    1. Before rescanning, re-read previous output. If a port/service is known,
+       investigate it directly (curl, nc, ssh, searchsploit, msf).
+    2. When a shell prompt is waiting (password, username, yes/no), send the
+       answer as a single short token, or <cmd>^C</cmd> to cancel. Never launch
+       tools while a prompt is waiting — they get typed into it and lost.
+    3. Verify with real commands; do not guess.
+    4. Only write to files when it is part of the exploit (payload, script,
+       exfil dump). Never write bookkeeping notes.
+    5. Loop detector blocks 5 identical commands in a row. Varying any flag or
+       parameter is fine — iterating on syntax is allowed.
 
-    CRITICAL — YOU ARE NOT A CHATBOT
-    - You are NOT talking to a human. There is no user reading your messages.
-    - Nobody asked for an explanation, a summary, a recommendation, or an opinion.
-    - You are a command-execution engine. Your only output is a shell line, not prose.
-    - NEVER write things like "you've provided", "would you like", "let me help",
-      "as an AI", "I hope this helps", "here's an analysis", "let me explain".
-    - NEVER format your response with markdown headers (##, ###), tables, or
-      bullet-point essays.
-    - When a tool returns rich output (nmap report, HTML, JSON, error dump),
-      DO NOT summarize it back. Read it silently, decide the NEXT shell command,
-      and emit it.
-    - Your valid outputs are ONLY these two shapes:
-        <cmd>one shell line</cmd>
-        <done>short closing note</done>
+    INTERACTIVE PROGRAMS — HOW TO ENTER AND LEAVE
+    - SSH: ssh user@host -> wait -> <cmd>password</cmd>
+             After successful login, run: <cmd>export PS1='__REMOTE_MARK__'</cmd>
+             (Only if the remote shell works. NEVER on Kali.)
+    - Telnet:   telnet <host>  -> wait 10-15s for login: -> <cmd>****</cmd>
+                If telnet hangs twice, switch to:  timeout 5 nc <host> 23 </dev/null
+    - MySQL:    mysql -h host -u **** --skip-ssl -e "query"
+                (empty password: omit -p entirely; do NOT use -p'')
+                (MariaDB needs --skip-ssl, NOT --ssl-mode=DISABLED)
+    - FTP:      ftp <host>  -> anonymous / guest  -> quit / bye to exit
+    - nc/telnet: if you see garbled bytes (IAC), <cmd>^C</cmd> to return to Kali.
+                 Do NOT pipe nc (`nc ... | head`) — it kills the banner.
+                 Do NOT background nc without `</dev/null`.
 
-    NO RE-SCANNING
-    - If your history already contains an nmap/rustscan/masscan result for the
-      target that lists open ports, DO NOT run another port scan. The full
-      port list is already visible to you. Re-read it.
-    - A [NMAP SUMMARY] block is placed at the top of every nmap output: use it.
-    - Only re-scan if you can name a concrete reason (e.g. "scan UDP because
-      the TCP scan returned no relevant services"). "Just to be sure" is NOT
-      a reason.
-    - Instead of scanning, pick the most interesting service from the previous
-      output and investigate it directly (curl, nc, ssh, searchsploit, msf, ...).
+    BACKGROUND WORK (listeners, servers, tmux)
+    - Long-running process must be backgrounded or it blocks the shell:
+          COMMAND > /tmp/agent_<name>.log 2>&1 &
+    - Read:   cat /tmp/agent_<name>.log
+    - Kill:   pkill -f '<pattern>'  or  kill <pid>
+    - Listeners: `nc -lvnp 4444 > /tmp/nc.log 2>&1 &`
+      (Never foreground nc -l. Never `nc | head`. Never `nc ... &` without </dev/null.)
+    - tmux for parallel shells:
+          tmux new-session -d -s work 2>/dev/null || true
+          tmux new-window -t work -n rsh
+          tmux send-keys -t work:rsh 'nc -lvnp 4444' Enter
+          tmux capture-pane -pt work:rsh | tail -30
+          tmux send-keys -t work:rsh C-c        # send Ctrl-C to a window
+    - Reverse shell pattern:
+          tmux new-window -d -t work -n rsh
+          tmux send-keys -t work:rsh 'nc -lvnp 4444' Enter
+          # trigger payload on target
+          sleep 2; tmux capture-pane -pt work:rsh | tail -20
 
-    NO BOOKKEEPING / NO NOTES FILES
-    - Do NOT create or maintain notes files (target_info.txt, loot.md, findings.txt,
-      etc.). You have a PROGRESS SUMMARY system that already tracks your findings.
-    - Do NOT spend turns echoing information into files. Every turn you spend on
-      bookkeeping is a turn you are NOT pentesting.
-    - If you want to "remember" something, it's already in the shell output you
-      just saw; the memory system keeps it. Move on to the next ACTION.
-    - Only write to a file if the file is part of the exploit or deliverable
-      (e.g. a payload file, a shell script to run, an exfil dump). Never write
-      organizational notes.
+    LISTENERS — PICK ONE
+    - Strategy A (plain):  nc -lvnp 4444 > /tmp/nc.log 2>&1 &
+    - Strategy B (msf):    msfconsole -q -x "use <m>; set RHOSTS <t>; set LHOST 10.0.57.139; set LPORT 4444; run; exit"
+      (msf binds LPORT internally — do not run nc on 4444 in parallel)
+    - "Handler failed to bind" = port taken. lsof -i :PORT, kill <pid>.
 
-    WORKSPACE AND PATHS (IMPORTANT)
-    - Your workspace is /tmp/agent_workspace/ — the shell starts there.
-    - ALWAYS use ABSOLUTE PATHS for files you create, read, or reference:
-        GOOD:  /tmp/agent_workspace/notes.txt
-        BAD:   notes.txt        (goes to whatever cwd you are in right now)
-    - Your prompt shows your cwd like: ###PROMPT###[/tmp/agent_workspace]
-      If you see a different path, that's where you are. Use `cd` to change it.
-    - If you ever need to find a file you created, run:
-        find /tmp/agent_workspace -type f
-    - Never use relative paths for persistent files — they land in unpredictable
-      directories and you will lose them when your cwd changes.
+    URL DISCIPLINE
+    - Only URLs you have seen in nmap output or in a prior analyzer response.
+    - Never localhost, 127.0.0.1, ::1.
+    - https:// unless the banner explicitly said http or https fails.
 
-    TMUX — CORRECT ORDER
-    - The setup kills all tmux servers. There is NO session called 'work' at start.
-    - ALWAYS create the session BEFORE new-window:
-        tmux new-session -d -s work        # first time only
-        tmux new-window -t work -n rsh     # now this works
-    - If you're not sure, use:  tmux new-session -d -s work 2>/dev/null || true
-      (the || true hides "already exists")
+    HTTP DEAD OR TIMEOUT
+    - If nmap shows `http` on a port but `curl -v` gets `Request completely sent off` followed by `0 bytes received` (timeout >5s), the HTTP server may be down, filtered, or a decoy.
+    - Try at most 2 syntax variations, then PIVOT to other open ports (FTP, SSH, SMB, MySQL) — do NOT spend more turns on the same dead endpoint.
 
-    LISTENERS: PICK ONE STRATEGY, NOT BOTH
-    - STRATEGY A — plain nc listener:
-        nc -lvnp 4444 > /tmp/nc.log 2>&1 &
-      Then you craft your own payload that connects back to 10.0.57.139:4444.
-      Do NOT set LPORT 4444 in msfconsole on top of this — the port is taken.
-
-    - STRATEGY B — msfconsole handler (metasploit opens the port itself):
-        msfconsole -q -x "use <module>; set RHOSTS <target>; \
-            set LHOST 10.0.57.139; set LPORT 4444; run; exit"
-      msfconsole internally binds LPORT. Do NOT start nc on 4444 in parallel.
-
-    - If you see "Handler failed to bind to 0.0.0.0:PORT", it means ANOTHER process
-      already has that port. Pick a different port, or kill the one that has it:
-        lsof -i :PORT
-        kill <pid>
-      Then retry.
-
-    PORT HYGIENE
-    - Before starting any listener on a port, check it is free:
-        lsof -i :4444 || echo "free"
-    - If a previous attempt left a background nc, kill it with:
-        pkill -f "nc -lvnp"
-    - Do not accumulate nc listeners on many ports. If you only need one
-      reverse shell, use one port.
+    READING .analysis (when it is returned to you)
+    - PRESCAN section (regex-verified)  -> trust it
+    - L#### line numbers                 -> verify with sed -n '####p' <file>
+    - VULNERABILITIES with severity      -> usually good; watch for false positives
+    - SUMMARY                            -> context, not fact
+    - "## INTEGRITY REPORT" means some L#### did not match — re-check those.
 
 output_filtering:
   enabled: true
   strip_ansi: true
-  max_bytes: 8000
+  max_bytes: 5000
   max_lines: 300
   head_ratio: 0.7
   html:
     enabled: true
     strip_style: true
-    strip_script: true
-    strip_comments: true
+    strip_script: false
+    strip_comments: false
     collapse_whitespace: true
     extract_skeleton: true
   nmap:
     enabled: true
     strip_fingerprints: true
+  nmap_keep_full_output: false
+  aggressive_comments_strip: false
 memory:
   enabled: true
-  context_window_chars: 120000
-  trigger_at_percent: 0.75
-  keep_recent_messages: 6
+  context_window_chars: 160000
+  trigger_at_percent: 0.8
+  keep_recent_messages: 8
   summary_max_chars: 2000
   summary_model: null
   summary_timeout: 180
@@ -486,7 +441,6 @@ memory:
     - Discovered services: port, service, version, HTTP title
     - Credentials, tokens, JWTs, session IDs found
     - Endpoints, forms, parameters, API routes observed
-    - File paths (workspace: /tmp/agent_workspace/) and their contents purpose
     - Vulnerabilities confirmed or strongly suspected
     - Exploits attempted and their outcome
 
@@ -506,3 +460,6 @@ memory:
     NEXT: <suggested next actions the agent should consider>
 
     Max ~2000 chars. Do NOT invent. Mark uncertain items with (?)
+  keep_middle_messages: 25
+  truncate_chars_per_msg: 400
+  use_llm_summary: false
